@@ -24,6 +24,20 @@
 </div>
 
 <div class="card">
+  <h2>试剪峰值对照（不改剪法）</h2>
+  <p class="muted" style="margin-top:0">
+    选一块试剪，比较<b>当前剪法</b>与<b>切换该块保留状态后</b>两种成片的全片峰值
+    （从零状态低通、量化前的最大绝对值），各标出峰值所在的成片 0 基样点号。
+    试算只读取上传时建好的摘要、不读取原始样点，也不会真的改动剪法；期间仍可在另一窗口撤块或恢复。
+  </p>
+  <label for="trial-chunk">试剪块号（0 .. {{ state.n_chunks - 1 }}，超过 512 块不支持试算）</label>
+  <input id="trial-chunk" type="number" min="0" max="{{ state.n_chunks - 1 }}"
+         style="max-width:260px" placeholder="例如 3">
+  <button id="btn-trial" type="button">试算两种剪法峰值</button>
+  <div id="trial-meta" class="stats" style="display:none"></div>
+</div>
+
+<div class="card">
   <h2>成片时码跳听</h2>
   <label for="k">输入成片样点号（从 0 起算，有效范围 0 .. <span id="kmax">{{ state.kept_samples - 1 }}</span>）</label>
   <input id="k" type="number" min="0" style="max-width:260px" placeholder="例如 0、4096、10000">
@@ -78,6 +92,56 @@ async function toggle(i, currentlyActive) {
     <b>${s.summary_touches}</b> 个，读取原始块 <b>${s.chunk_loads}</b> 个
     （总块数 ${state.n_chunks}，摘要访问量随总块数对数增长）`;
 }
+
+function fmtPeak(r) {
+  if (r.empty) {
+    return `<b>空片</b>（没有保留样点，无峰值）`;
+  }
+  return `峰值 <b>${r.peak.toFixed(4)}</b>（量化前 PCM16 单位），` +
+         `成片样点号 <b>${r.sample_index}</b>` +
+         `（原块 #${r.chunk}，块内偏移 ${r.offset}，原始录音样点 ${r.original_sample}）`;
+}
+
+document.getElementById("btn-trial").onclick = async () => {
+  clearBanner();
+  const raw = document.getElementById("trial-chunk").value.trim();
+  const i = Number(raw);
+  const meta = document.getElementById("trial-meta");
+  if (!Number.isInteger(i) || i < 0 || i >= state.n_chunks) {
+    banner("请输入 0 到 " + (state.n_chunks - 1) + " 之间的块号", "err");
+    meta.style.display = "none";
+    return;
+  }
+  const btn = document.getElementById("btn-trial");
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/p/${PID}/chunks/${i}/peak-trial`, {method: "POST"});
+    const data = await resp.json();
+    if (!resp.ok) {
+      banner(data.error || "试算失败", "err");
+      meta.style.display = "none";
+      return;
+    }
+    const cur = data.results.current;
+    const sw = data.results.switched;
+    const action = data.target_was_active ? "撤下" : "恢复";
+    meta.style.display = "block";
+    meta.innerHTML =
+      `<div>块 #${i} 当前为${data.target_was_active ? "保留" : "撤下"}，` +
+      `对照剪法 = ${action}该块（其余块不动）。试算未改动实际剪法。</div>` +
+      `<table style="margin-top:8px">` +
+      `<tr><th>剪法</th><th>保留样点</th><th>全片峰值与标记样点号</th></tr>` +
+      `<tr><td>当前剪法</td><td>${cur.kept_samples}</td><td style="text-align:left">${fmtPeak(cur)}</td></tr>` +
+      `<tr><td>切换块 #${i}（${action}）</td><td>${sw.kept_samples}</td><td style="text-align:left">${fmtPeak(sw)}</td></tr>` +
+      `</table>` +
+      `<div class="muted" style="margin-top:6px">` +
+      `每块峰值由上传摘要经上/下直线包络查询得到，单块最多 ` +
+      `${Math.max(cur.max_per_chunk_comparisons || 0, sw.max_per_chunk_comparisons || 0)} ` +
+      `次/包络比较，全程零原始样点读取。</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 document.getElementById("btn-audition").onclick = async () => {
   clearBanner();

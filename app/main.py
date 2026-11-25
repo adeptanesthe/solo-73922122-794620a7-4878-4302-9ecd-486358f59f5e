@@ -10,7 +10,9 @@ from flask import (
     Flask, abort, jsonify, redirect, render_template, request, send_file, url_for,
 )
 
-from .engine import CHUNK, Project, TimecodeOutOfRange
+from .engine import (
+    CHUNK, TRIAL_MAX_CHUNKS, Project, TimecodeOutOfRange, TrialTooManyChunks,
+)
 from .wavio import WavFormatError, build_mono_pcm16_wav, read_mono_pcm16_wav
 
 app = Flask(__name__)
@@ -121,6 +123,77 @@ def api_toggle(pid: str, i: int):
             "chunk_loads": project.chunk_loads,
         }
         return jsonify({"state": project_state(project), "stats": stats})
+
+
+def _peak_payload(tag: str, res, project: Project) -> dict:
+    """把一种剪法的 PeakResult 转成前端 JSON（空片用 null 字段表示）。"""
+    if res.peak is None:
+        return {
+            "cut": tag,
+            "empty": True,
+            "kept_samples": 0,
+            "peak": None,
+            "sample_index": None,
+            "chunk": None,
+            "offset": None,
+        }
+    return {
+        "cut": tag,
+        "empty": False,
+        "kept_samples": res.kept_samples,
+        "peak": res.peak,
+        "sample_index": res.sample_index,
+        "chunk": res.chunk,
+        "offset": res.offset,
+        "original_sample": res.chunk * CHUNK + res.offset,
+        "max_per_chunk_comparisons": res.max_per_chunk,
+    }
+
+
+@app.post("/api/p/<pid>/chunks/<int:i>/peak-trial")
+def api_peak_trial(pid: str, i: int):
+    """试剪块 i：比较当前剪法与切换块 i 保留状态后的全片量化前峰值。
+
+    试算只读上传摘要、不改剪法；锁外计算以免阻塞另一窗口的撤/恢复。
+    前后各取一次剪法版本号，期间剪法变过（即使已改回）则结果作废、提示重算。
+    """
+    project = get_project(pid)
+    if not (0 <= i < project.n):
+        return jsonify({"error": f"块号 {i} 越界，共 {project.n} 块"}), 400
+    if project.n > TRIAL_MAX_CHUNKS:
+        return jsonify({
+            "error": f"试算仅支持至多 {TRIAL_MAX_CHUNKS} 块的录音，"
+                     f"当前 {project.n} 块，无法试算"
+        }), 400
+
+    lock = get_lock(pid)
+    with lock:
+        version_at_start = project.edit_version
+        active_at_start = project.active[:]
+        target_active = project.active[i]
+
+    # 锁外计算：只用摘要，不触碰剪法状态，其他窗口仍可撤块/恢复
+    current, switched = project.peak_trial(i)
+
+    with lock:
+        changed = (
+            project.edit_version != version_at_start
+            or project.active != active_at_start
+        )
+        if changed:
+            return jsonify({
+                "error": "试算期间剪法发生过变化（即使已经改回），结果已作废，请重新试算",
+                "stale": True,
+            }), 409
+        return jsonify({
+            "chunk": i,
+            "target_was_active": target_active,
+            "stale": False,
+            "results": {
+                "current": _peak_payload("current", current, project),
+                "switched": _peak_payload("switched", switched, project),
+            },
+        })
 
 
 def _audition_result(project: Project, k: int) -> tuple[dict, bytes]:

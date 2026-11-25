@@ -166,6 +166,48 @@ def main() -> None:
         d = json.loads(raw)
         check(status == 400 and "重新选择" in d["error"], f"k={bad} -> 400 提示重选")
 
+    print("[7] 试剪峰值：两种剪法对照，峰值/样点号与逐样点参考一致")
+    def ref_peak(retain_mask):
+        s = 0.0
+        cursor = 0
+        best_abs, best_k = -1.0, -1
+        for b in range(40):
+            if not retain_mask[b]:
+                continue
+            for v in pcm_all[b * 4096:(b + 1) * 4096].astype(np.float64):
+                s = a * s + (1.0 - a) * v
+                if abs(s) > best_abs:
+                    best_abs, best_k = abs(s), cursor
+                cursor += 1
+        return (best_abs, best_k) if best_k >= 0 else None
+
+    target = 5
+    status, raw, _ = http("POST", f"{BASE}/api/p/{pid}/chunks/{target}/peak-trial")
+    check(status == 200, f"试算 200（实得 {status}）")
+    td = json.loads(raw)
+    cur, sw = td["results"]["current"], td["results"]["switched"]
+    mask_now = [b not in off for b in range(40)]
+    mask_sw = mask_now[:]
+    mask_sw[target] = not mask_sw[target]
+    rc, rs = ref_peak(mask_now)
+    wc, ws_k = ref_peak(mask_sw)
+    check(abs(cur["peak"] - rc) <= 0.01 and cur["sample_index"] == rs,
+          f"当前剪法峰值 {cur['peak']:.4f}/{cur['sample_index']} 对照参考 {rc:.4f}/{rs}")
+    check(abs(sw["peak"] - wc) <= 0.01 and sw["sample_index"] == ws_k,
+          f"切换剪法峰值 {sw['peak']:.4f}/{sw['sample_index']} 对照参考 {wc:.4f}/{ws_k}")
+    check(cur["max_per_chunk_comparisons"] <= 32, "单块（上壳+下壳）比较总数 ≤ 32")
+    st_after = json.loads(http("GET", f"{BASE}/api/p/{pid}/state")[1])
+    check([c["active"] for c in st_after["chunks"]] == mask_now, "试算后剪法未改变")
+
+    print("[8] 空片试算：撤光全部块")
+    for b in range(40):
+        http("POST", f"{BASE}/api/p/{pid}/chunks/{b}/toggle",
+             json.dumps({"active": False}).encode(), {"Content-Type": "application/json"})
+    status, raw, _ = http("POST", f"{BASE}/api/p/{pid}/chunks/0/peak-trial")
+    ed = json.loads(raw)
+    check(status == 200 and ed["results"]["current"]["empty"] and
+          ed["results"]["current"]["peak"] is None, "全撤后当前剪法显示空片")
+
     print()
     if failures:
         print(f"{len(failures)} 项失败")
